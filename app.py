@@ -705,14 +705,11 @@ parametres_generaux = charger_parametres_generaux()
 st.title("Gestion Budget Freelance")
 
 st.subheader(
-    "Suivi simple de mes revenus, "
-    "de mes dépenses et de mon épargne"
+    "Suivi simple de mes revenus."
 )
 
 st.caption(
-    "Le chiffre d’affaires arrive sur Lydia. "
-    "L’URSSAF et le loyer sont retirés automatiquement, "
-    "puis le reste est transféré vers Revolut."
+    "Mon application web pour gérer mon budget , epargner et faire un suivi de mon activité freelance "
 )
 
 
