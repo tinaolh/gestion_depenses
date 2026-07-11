@@ -1,25 +1,61 @@
+from calendar import monthrange
 from datetime import date
 from pathlib import Path
+from uuid import uuid4
 
 import pandas as pd
 import streamlit as st
 
 
-# =====================================================
+# ============================================================
 # CONFIGURATION
-# =====================================================
+# ============================================================
 
 st.set_page_config(
-    page_title="Mon budget freelance",
-    page_icon="💸",
+    page_title="Budget personnel",
     layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-FICHIER_DEPENSES = Path("depenses.csv")
-FICHIER_PARAMETRES = Path("parametres.csv")
-FICHIER_REMBOURSEMENTS = Path("remboursements_dette.csv")
+st.markdown(
+    """
+    <style>
+        .block-container {
+            max-width: 1280px;
+            padding-top: 1.5rem;
+            padding-bottom: 3rem;
+        }
 
-CATEGORIES = [
+        h1, h2, h3 {
+            letter-spacing: -0.02em;
+        }
+
+        [data-testid="stMetric"] {
+            border: 1px solid rgba(128, 128, 128, 0.25);
+            border-radius: 12px;
+            padding: 14px;
+        }
+
+        [data-testid="stSidebar"] {
+            border-right: 1px solid rgba(128, 128, 128, 0.18);
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+DATA_DIR = Path("data")
+DATA_DIR.mkdir(exist_ok=True)
+
+FICHIER_DEPENSES = DATA_DIR / "depenses.csv"
+FICHIER_MOIS = DATA_DIR / "budgets_mensuels.csv"
+FICHIER_REMBOURSEMENTS = DATA_DIR / "remboursements_dette.csv"
+FICHIER_RECURRENCES = DATA_DIR / "depenses_recurrentes.csv"
+FICHIER_GENERAL = DATA_DIR / "parametres_generaux.csv"
+
+COMPTES = ["Revolut", "Lydia"]
+
+CATEGORIES_DEPENSES = [
     "Logement",
     "Courses",
     "Restaurant",
@@ -32,11 +68,12 @@ CATEGORIES = [
     "Soraya",
     "Nacer",
     "Malek",
-    "Dette appartement",
     "Autre",
 ]
 
-MOIS = {
+CATEGORIES_BUDGET = CATEGORIES_DEPENSES + ["Dette appartement"]
+
+MOIS_FR = {
     1: "Janvier",
     2: "Février",
     3: "Mars",
@@ -51,445 +88,946 @@ MOIS = {
     12: "Décembre",
 }
 
+PERIODES = list(pd.period_range("2026-07", "2027-07", freq="M"))
 
-# =====================================================
-# FONCTIONS GÉNÉRALES
-# =====================================================
 
-def format_euros(montant):
-    """Affiche un montant au format euros."""
+# ============================================================
+# OUTILS
+# ============================================================
+
+def format_euros(montant: float) -> str:
     return f"{float(montant):,.2f} €".replace(",", " ")
 
 
-def lire_csv_securise(fichier, colonnes):
-    """Lit un fichier CSV ou crée un tableau vide."""
+def libelle_periode(periode: pd.Period) -> str:
+    return f"{MOIS_FR[periode.month]} {periode.year}"
 
+
+def lire_csv(fichier: Path, colonnes: list[str]) -> pd.DataFrame:
     if not fichier.exists():
         return pd.DataFrame(columns=colonnes)
 
     try:
-        dataframe = pd.read_csv(fichier)
+        df = pd.read_csv(fichier)
     except (pd.errors.EmptyDataError, UnicodeDecodeError):
         return pd.DataFrame(columns=colonnes)
 
     for colonne in colonnes:
-        if colonne not in dataframe.columns:
-            dataframe[colonne] = None
+        if colonne not in df.columns:
+            df[colonne] = None
 
-    return dataframe[colonnes]
+    return df[colonnes]
 
 
-# =====================================================
-# GESTION DES DÉPENSES
-# =====================================================
+def sauvegarder_csv(df: pd.DataFrame, fichier: Path) -> None:
+    df.to_csv(fichier, index=False)
 
-def charger_depenses():
-    """Charge les dépenses personnelles."""
 
-    colonnes = [
-        "date",
-        "description",
-        "categorie",
-        "montant",
-    ]
+def convertir_dates(df: pd.DataFrame, colonne: str = "date") -> pd.DataFrame:
+    if colonne in df.columns and not df.empty:
+        df[colonne] = pd.to_datetime(df[colonne], errors="coerce")
+    return df
 
-    dataframe = lire_csv_securise(
-        FICHIER_DEPENSES,
-        colonnes,
+
+def convertir_numerique(
+    df: pd.DataFrame,
+    colonnes: list[str],
+) -> pd.DataFrame:
+    for colonne in colonnes:
+        if colonne in df.columns and not df.empty:
+            df[colonne] = pd.to_numeric(df[colonne], errors="coerce")
+    return df
+
+
+def filtrer_periode(
+    df: pd.DataFrame,
+    periode: pd.Period,
+    colonne_date: str = "date",
+) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+
+    dates = pd.to_datetime(df[colonne_date], errors="coerce")
+    return df.loc[dates.dt.to_period("M") == periode].copy()
+
+
+# ============================================================
+# DEPENSES
+# ============================================================
+
+COLONNES_DEPENSES = [
+    "id",
+    "date",
+    "description",
+    "categorie",
+    "montant",
+    "compte",
+    "recurrence_id",
+]
+
+
+def charger_depenses() -> pd.DataFrame:
+    df = lire_csv(FICHIER_DEPENSES, COLONNES_DEPENSES)
+    df = convertir_dates(df)
+    df = convertir_numerique(df, ["montant"])
+
+    if not df.empty:
+        df["id"] = df["id"].fillna("").astype(str)
+        df["description"] = df["description"].fillna("").astype(str)
+        df["categorie"] = df["categorie"].fillna("Autre").astype(str)
+        df["compte"] = df["compte"].fillna("Revolut").astype(str)
+        df["recurrence_id"] = df["recurrence_id"].fillna("").astype(str)
+        df = df.dropna(subset=["date", "montant"]).reset_index(drop=True)
+
+    return df
+
+
+def sauvegarder_depenses(df: pd.DataFrame) -> None:
+    copie = df.copy()
+
+    if not copie.empty:
+        copie["date"] = pd.to_datetime(copie["date"]).dt.strftime("%Y-%m-%d")
+
+    sauvegarder_csv(copie, FICHIER_DEPENSES)
+
+
+def ajouter_depense(
+    df: pd.DataFrame,
+    date_depense: date,
+    description: str,
+    categorie: str,
+    montant: float,
+    compte: str,
+    recurrence_id: str = "",
+) -> pd.DataFrame:
+    nouvelle = pd.DataFrame(
+        [{
+            "id": uuid4().hex,
+            "date": pd.Timestamp(date_depense),
+            "description": description.strip(),
+            "categorie": categorie,
+            "montant": float(montant),
+            "compte": compte,
+            "recurrence_id": recurrence_id,
+        }]
     )
 
-    if dataframe.empty:
-        return dataframe
-
-    dataframe["date"] = pd.to_datetime(
-        dataframe["date"],
-        errors="coerce",
-    )
-
-    dataframe["montant"] = pd.to_numeric(
-        dataframe["montant"],
-        errors="coerce",
-    )
-
-    dataframe["description"] = (
-        dataframe["description"]
-        .fillna("")
-        .astype(str)
-    )
-
-    dataframe["categorie"] = (
-        dataframe["categorie"]
-        .fillna("Autre")
-        .astype(str)
-    )
-
-    dataframe = dataframe.dropna(
-        subset=["date", "montant"]
-    )
-
-    return dataframe.reset_index(drop=True)
+    resultat = pd.concat([df, nouvelle], ignore_index=True)
+    sauvegarder_depenses(resultat)
+    return resultat
 
 
-def enregistrer_depenses(dataframe):
-    """Enregistre les dépenses dans le fichier CSV."""
+# ============================================================
+# PARAMETRES MENSUELS
+# ============================================================
 
-    dataframe_a_enregistrer = dataframe.copy()
+COLONNES_MOIS_BASE = [
+    "periode",
+    "ca_revolut",
+    "ca_lydia",
+    "taux_urssaf",
+    "compte_urssaf",
+    "charges_pro",
+    "compte_charges_pro",
+    "objectif_epargne",
+    "solde_initial_revolut",
+    "solde_initial_lydia",
+]
 
-    if not dataframe_a_enregistrer.empty:
-        dataframe_a_enregistrer["date"] = pd.to_datetime(
-            dataframe_a_enregistrer["date"]
-        ).dt.strftime("%Y-%m-%d")
-
-    dataframe_a_enregistrer.to_csv(
-        FICHIER_DEPENSES,
-        index=False,
-    )
-
-
-# =====================================================
-# GESTION DE LA DETTE
-# =====================================================
-
-def charger_remboursements():
-    """Charge les remboursements de la dette."""
-
-    colonnes = [
-        "date",
-        "description",
-        "montant",
-    ]
-
-    dataframe = lire_csv_securise(
-        FICHIER_REMBOURSEMENTS,
-        colonnes,
-    )
-
-    if dataframe.empty:
-        return dataframe
-
-    dataframe["date"] = pd.to_datetime(
-        dataframe["date"],
-        errors="coerce",
-    )
-
-    dataframe["montant"] = pd.to_numeric(
-        dataframe["montant"],
-        errors="coerce",
-    )
-
-    dataframe["description"] = (
-        dataframe["description"]
-        .fillna("Remboursement dette appartement")
-        .astype(str)
-    )
-
-    dataframe = dataframe.dropna(
-        subset=["date", "montant"]
-    )
-
-    return dataframe.reset_index(drop=True)
+COLONNES_MOIS = COLONNES_MOIS_BASE + [
+    f"budget_{categorie}" for categorie in CATEGORIES_BUDGET
+]
 
 
-def enregistrer_remboursements(dataframe):
-    """Enregistre les remboursements de la dette."""
-
-    dataframe_a_enregistrer = dataframe.copy()
-
-    if not dataframe_a_enregistrer.empty:
-        dataframe_a_enregistrer["date"] = pd.to_datetime(
-            dataframe_a_enregistrer["date"]
-        ).dt.strftime("%Y-%m-%d")
-
-    dataframe_a_enregistrer.to_csv(
-        FICHIER_REMBOURSEMENTS,
-        index=False,
-    )
-
-
-# =====================================================
-# GESTION DES PARAMÈTRES
-# =====================================================
-
-def charger_parametres():
-    """Charge les paramètres de l’application."""
-
-    parametres_defaut = {
-        "chiffre_affaires": 5500.0,
+def valeurs_mois_defaut(periode: pd.Period) -> dict:
+    valeurs = {
+        "periode": str(periode),
+        "ca_revolut": 0.0,
+        "ca_lydia": 0.0,
         "taux_urssaf": 28.0,
-        "autres_charges_pro": 0.0,
-        "objectif_epargne": 500.0,
-        "dette_initiale": 2500.0,
+        "compte_urssaf": "Revolut",
+        "charges_pro": 0.0,
+        "compte_charges_pro": "Revolut",
+        "objectif_epargne": 0.0,
+        "solde_initial_revolut": 0.0,
+        "solde_initial_lydia": 0.0,
     }
 
-    for categorie in CATEGORIES:
-        parametres_defaut[categorie] = 0.0
+    for categorie in CATEGORIES_BUDGET:
+        valeurs[f"budget_{categorie}"] = 0.0
 
-    if not FICHIER_PARAMETRES.exists():
-        return parametres_defaut
+    return valeurs
+
+
+def charger_mois() -> pd.DataFrame:
+    df = lire_csv(FICHIER_MOIS, COLONNES_MOIS)
+
+    if not df.empty:
+        df["periode"] = df["periode"].astype(str)
+
+        colonnes_numeriques = [
+            colonne
+            for colonne in COLONNES_MOIS
+            if colonne not in {
+                "periode",
+                "compte_urssaf",
+                "compte_charges_pro",
+            }
+        ]
+
+        df = convertir_numerique(df, colonnes_numeriques)
+        df["compte_urssaf"] = (
+            df["compte_urssaf"].fillna("Revolut").astype(str)
+        )
+        df["compte_charges_pro"] = (
+            df["compte_charges_pro"].fillna("Revolut").astype(str)
+        )
+        df = df.drop_duplicates(subset=["periode"], keep="last")
+
+    return df
+
+
+def obtenir_parametres_mois(
+    df_mois: pd.DataFrame,
+    periode: pd.Period,
+) -> dict:
+    valeurs = valeurs_mois_defaut(periode)
+
+    if df_mois.empty:
+        return valeurs
+
+    ligne = df_mois.loc[df_mois["periode"] == str(periode)]
+
+    if ligne.empty:
+        return valeurs
+
+    donnees = ligne.iloc[-1].to_dict()
+
+    for cle, valeur_defaut in valeurs.items():
+        valeur = donnees.get(cle, valeur_defaut)
+
+        if pd.isna(valeur):
+            donnees[cle] = valeur_defaut
+
+    return donnees
+
+
+def enregistrer_parametres_mois(
+    df_mois: pd.DataFrame,
+    valeurs: dict,
+) -> pd.DataFrame:
+    periode = str(valeurs["periode"])
+    df_mois = df_mois.loc[df_mois["periode"] != periode].copy()
+    df_mois = pd.concat([df_mois, pd.DataFrame([valeurs])], ignore_index=True)
+
+    ordre = {str(p): i for i, p in enumerate(PERIODES)}
+    df_mois["_ordre"] = df_mois["periode"].map(ordre).fillna(9999)
+    df_mois = df_mois.sort_values("_ordre").drop(columns="_ordre")
+
+    sauvegarder_csv(df_mois, FICHIER_MOIS)
+    return df_mois
+
+
+# ============================================================
+# DETTE APPARTEMENT
+# ============================================================
+
+COLONNES_REMBOURSEMENTS = [
+    "id",
+    "date",
+    "description",
+    "montant",
+    "compte",
+]
+
+
+def charger_remboursements() -> pd.DataFrame:
+    df = lire_csv(FICHIER_REMBOURSEMENTS, COLONNES_REMBOURSEMENTS)
+    df = convertir_dates(df)
+    df = convertir_numerique(df, ["montant"])
+
+    if not df.empty:
+        df["id"] = df["id"].fillna("").astype(str)
+        df["description"] = (
+            df["description"]
+            .fillna("Remboursement dette appartement")
+            .astype(str)
+        )
+        df["compte"] = df["compte"].fillna("Revolut").astype(str)
+        df = df.dropna(subset=["date", "montant"]).reset_index(drop=True)
+
+    return df
+
+
+def sauvegarder_remboursements(df: pd.DataFrame) -> None:
+    copie = df.copy()
+
+    if not copie.empty:
+        copie["date"] = pd.to_datetime(copie["date"]).dt.strftime("%Y-%m-%d")
+
+    sauvegarder_csv(copie, FICHIER_REMBOURSEMENTS)
+
+
+def charger_parametres_generaux() -> dict:
+    defaut = {"dette_initiale": 2500.0}
+
+    if not FICHIER_GENERAL.exists():
+        return defaut
 
     try:
-        dataframe = pd.read_csv(
-            FICHIER_PARAMETRES
-        )
+        df = pd.read_csv(FICHIER_GENERAL)
     except pd.errors.EmptyDataError:
-        return parametres_defaut
+        return defaut
 
-    if dataframe.empty:
-        return parametres_defaut
+    if df.empty:
+        return defaut
 
-    ancienne_ligne = dataframe.iloc[0].to_dict()
+    valeur = pd.to_numeric(
+        pd.Series([df.iloc[0].get("dette_initiale")]),
+        errors="coerce",
+    ).iloc[0]
 
-    # Compatibilité avec les anciennes versions
-    if (
-        "chiffre_affaires" not in ancienne_ligne
-        and "revenu" in ancienne_ligne
-        and pd.notna(ancienne_ligne["revenu"])
-    ):
-        ancienne_ligne["chiffre_affaires"] = (
-            ancienne_ligne["revenu"]
-        )
+    if pd.notna(valeur):
+        defaut["dette_initiale"] = float(valeur)
 
-    for cle in parametres_defaut:
-        valeur = ancienne_ligne.get(cle)
-
-        if pd.notna(valeur):
-            try:
-                parametres_defaut[cle] = float(valeur)
-            except (TypeError, ValueError):
-                pass
-
-    return parametres_defaut
+    return defaut
 
 
-def enregistrer_parametres(parametres):
-    """Enregistre les paramètres."""
-
-    pd.DataFrame([parametres]).to_csv(
-        FICHIER_PARAMETRES,
-        index=False,
+def sauvegarder_parametres_generaux(dette_initiale: float) -> None:
+    sauvegarder_csv(
+        pd.DataFrame([{"dette_initiale": float(dette_initiale)}]),
+        FICHIER_GENERAL,
     )
 
 
-# =====================================================
-# CHARGEMENT DES DONNÉES
-# =====================================================
+# ============================================================
+# DEPENSES RECURRENTES
+# ============================================================
+
+COLONNES_RECURRENCES = [
+    "id",
+    "description",
+    "categorie",
+    "montant",
+    "compte",
+    "jour",
+    "debut",
+    "fin",
+    "active",
+]
+
+
+def charger_recurrences() -> pd.DataFrame:
+    df = lire_csv(FICHIER_RECURRENCES, COLONNES_RECURRENCES)
+
+    if not df.empty:
+        df["id"] = df["id"].fillna("").astype(str)
+        df["description"] = df["description"].fillna("").astype(str)
+        df["categorie"] = df["categorie"].fillna("Autre").astype(str)
+        df["compte"] = df["compte"].fillna("Revolut").astype(str)
+        df["montant"] = pd.to_numeric(df["montant"], errors="coerce")
+        df["jour"] = pd.to_numeric(df["jour"], errors="coerce")
+        df["debut"] = df["debut"].fillna("2026-07").astype(str)
+        df["fin"] = df["fin"].fillna("2027-07").astype(str)
+        df["active"] = (
+            df["active"]
+            .astype(str)
+            .str.lower()
+            .isin(["true", "1", "oui"])
+        )
+        df = df.dropna(subset=["montant", "jour"]).reset_index(drop=True)
+
+    return df
+
+
+def sauvegarder_recurrences(df: pd.DataFrame) -> None:
+    sauvegarder_csv(df, FICHIER_RECURRENCES)
+
+
+def recurrence_valable(
+    ligne: pd.Series,
+    periode: pd.Period,
+) -> bool:
+    if not bool(ligne["active"]):
+        return False
+
+    debut = pd.Period(str(ligne["debut"]), freq="M")
+    fin = pd.Period(str(ligne["fin"]), freq="M")
+    return debut <= periode <= fin
+
+
+def ajouter_recurrences_du_mois(
+    depenses: pd.DataFrame,
+    recurrents: pd.DataFrame,
+    periode: pd.Period,
+) -> tuple[pd.DataFrame, int]:
+    ajoutees = 0
+
+    for _, ligne in recurrents.iterrows():
+        if not recurrence_valable(ligne, periode):
+            continue
+
+        recurrence_id = str(ligne["id"])
+        deja_ajoutee = False
+
+        if not depenses.empty:
+            dates = pd.to_datetime(depenses["date"], errors="coerce")
+            deja_ajoutee = (
+                (depenses["recurrence_id"].astype(str) == recurrence_id)
+                & (dates.dt.to_period("M") == periode)
+            ).any()
+
+        if deja_ajoutee:
+            continue
+
+        dernier_jour = monthrange(periode.year, periode.month)[1]
+        jour = min(int(ligne["jour"]), dernier_jour)
+
+        depenses = ajouter_depense(
+            depenses,
+            date(periode.year, periode.month, jour),
+            str(ligne["description"]),
+            str(ligne["categorie"]),
+            float(ligne["montant"]),
+            str(ligne["compte"]),
+            recurrence_id=recurrence_id,
+        )
+        ajoutees += 1
+
+    return depenses, ajoutees
+
+
+# ============================================================
+# CALCULS DE SOLDES
+# ============================================================
+
+def calculer_soldes_mois(
+    periode: pd.Period,
+    df_mois: pd.DataFrame,
+    depenses: pd.DataFrame,
+    remboursements: pd.DataFrame,
+    cache: dict[str, dict],
+) -> dict:
+    cle = str(periode)
+
+    if cle in cache:
+        return cache[cle]
+
+    parametres = obtenir_parametres_mois(df_mois, periode)
+
+    if periode == PERIODES[0]:
+        debut_revolut = float(parametres["solde_initial_revolut"])
+        debut_lydia = float(parametres["solde_initial_lydia"])
+    else:
+        periode_precedente = periode - 1
+        precedent = calculer_soldes_mois(
+            periode_precedente,
+            df_mois,
+            depenses,
+            remboursements,
+            cache,
+        )
+        debut_revolut = precedent["fin_revolut"]
+        debut_lydia = precedent["fin_lydia"]
+
+    depenses_mois = filtrer_periode(depenses, periode)
+    remboursements_mois = filtrer_periode(remboursements, periode)
+
+    depenses_revolut = (
+        depenses_mois.loc[
+            depenses_mois["compte"] == "Revolut",
+            "montant",
+        ].sum()
+        if not depenses_mois.empty
+        else 0.0
+    )
+
+    depenses_lydia = (
+        depenses_mois.loc[
+            depenses_mois["compte"] == "Lydia",
+            "montant",
+        ].sum()
+        if not depenses_mois.empty
+        else 0.0
+    )
+
+    remboursements_revolut = (
+        remboursements_mois.loc[
+            remboursements_mois["compte"] == "Revolut",
+            "montant",
+        ].sum()
+        if not remboursements_mois.empty
+        else 0.0
+    )
+
+    remboursements_lydia = (
+        remboursements_mois.loc[
+            remboursements_mois["compte"] == "Lydia",
+            "montant",
+        ].sum()
+        if not remboursements_mois.empty
+        else 0.0
+    )
+
+    ca_revolut = float(parametres["ca_revolut"])
+    ca_lydia = float(parametres["ca_lydia"])
+    ca_total = ca_revolut + ca_lydia
+
+    urssaf = ca_total * float(parametres["taux_urssaf"]) / 100
+    charges_pro = float(parametres["charges_pro"])
+
+    urssaf_revolut = (
+        urssaf if parametres["compte_urssaf"] == "Revolut" else 0.0
+    )
+    urssaf_lydia = (
+        urssaf if parametres["compte_urssaf"] == "Lydia" else 0.0
+    )
+
+    charges_revolut = (
+        charges_pro
+        if parametres["compte_charges_pro"] == "Revolut"
+        else 0.0
+    )
+    charges_lydia = (
+        charges_pro
+        if parametres["compte_charges_pro"] == "Lydia"
+        else 0.0
+    )
+
+    fin_revolut = (
+        debut_revolut
+        + ca_revolut
+        - depenses_revolut
+        - remboursements_revolut
+        - urssaf_revolut
+        - charges_revolut
+    )
+
+    fin_lydia = (
+        debut_lydia
+        + ca_lydia
+        - depenses_lydia
+        - remboursements_lydia
+        - urssaf_lydia
+        - charges_lydia
+    )
+
+    resultat = {
+        "debut_revolut": debut_revolut,
+        "debut_lydia": debut_lydia,
+        "ca_revolut": ca_revolut,
+        "ca_lydia": ca_lydia,
+        "ca_total": ca_total,
+        "urssaf": urssaf,
+        "charges_pro": charges_pro,
+        "depenses_revolut": depenses_revolut,
+        "depenses_lydia": depenses_lydia,
+        "remboursements_revolut": remboursements_revolut,
+        "remboursements_lydia": remboursements_lydia,
+        "fin_revolut": fin_revolut,
+        "fin_lydia": fin_lydia,
+        "fin_total": fin_revolut + fin_lydia,
+        "depenses_total": depenses_revolut + depenses_lydia,
+        "remboursements_total": (
+            remboursements_revolut + remboursements_lydia
+        ),
+    }
+
+    cache[cle] = resultat
+    return resultat
+
+
+# ============================================================
+# CHARGEMENT
+# ============================================================
 
 depenses = charger_depenses()
+df_mois = charger_mois()
 remboursements = charger_remboursements()
-parametres = charger_parametres()
+recurrents = charger_recurrences()
+parametres_generaux = charger_parametres_generaux()
 
 
-# =====================================================
-# EN-TÊTE
-# =====================================================
+# ============================================================
+# PERIODE
+# ============================================================
 
-st.title("💸 Mon gestionnaire de budget freelance")
+st.sidebar.title("Budget personnel")
 
-st.write(
-    "Suis ton chiffre d’affaires, réserve l’URSSAF, "
-    "gère tes dépenses et rembourse ta dette appartement."
-)
-
-
-# =====================================================
-# BARRE LATÉRALE : PÉRIODE
-# =====================================================
-
-st.sidebar.header("📅 Période affichée")
-
-mois_choisi = st.sidebar.selectbox(
+periode_choisie = st.sidebar.selectbox(
     "Mois",
-    options=list(MOIS.keys()),
-    index=date.today().month - 1,
-    format_func=lambda valeur: MOIS[valeur],
+    options=PERIODES,
+    index=0,
+    format_func=libelle_periode,
 )
 
-annee_choisie = st.sidebar.number_input(
-    "Année",
-    min_value=2020,
-    max_value=2100,
-    value=date.today().year,
-    step=1,
+parametres_mois = obtenir_parametres_mois(
+    df_mois,
+    periode_choisie,
 )
 
 
-# =====================================================
-# BARRE LATÉRALE : FREELANCE
-# =====================================================
+# ============================================================
+# PARAMETRES DU MOIS
+# ============================================================
 
 st.sidebar.divider()
-st.sidebar.header("💼 Activité freelance")
+st.sidebar.subheader("Revenus et charges du mois")
 
-chiffre_affaires = st.sidebar.number_input(
-    "Chiffre d’affaires encaissé",
+ca_revolut = st.sidebar.number_input(
+    "Chiffre d’affaires reçu sur Revolut",
     min_value=0.0,
-    value=float(
-        parametres["chiffre_affaires"]
-    ),
+    value=float(parametres_mois["ca_revolut"]),
     step=50.0,
     format="%.2f",
-    help=(
-        "Indique uniquement l’argent réellement reçu "
-        "de tes clients pendant le mois."
-    ),
+)
+
+ca_lydia = st.sidebar.number_input(
+    "Chiffre d’affaires reçu sur Lydia",
+    min_value=0.0,
+    value=float(parametres_mois["ca_lydia"]),
+    step=50.0,
+    format="%.2f",
 )
 
 taux_urssaf = st.sidebar.number_input(
     "Taux URSSAF estimé (%)",
     min_value=0.0,
     max_value=100.0,
-    value=float(
-        parametres["taux_urssaf"]
-    ),
+    value=float(parametres_mois["taux_urssaf"]),
     step=0.1,
     format="%.1f",
 )
 
-autres_charges_pro = st.sidebar.number_input(
+compte_urssaf = st.sidebar.selectbox(
+    "Compte utilisé pour l’URSSAF",
+    COMPTES,
+    index=COMPTES.index(
+        str(parametres_mois["compte_urssaf"])
+        if str(parametres_mois["compte_urssaf"]) in COMPTES
+        else "Revolut"
+    ),
+)
+
+charges_pro = st.sidebar.number_input(
     "Autres charges professionnelles",
     min_value=0.0,
-    value=float(
-        parametres["autres_charges_pro"]
-    ),
+    value=float(parametres_mois["charges_pro"]),
     step=10.0,
     format="%.2f",
 )
 
+compte_charges_pro = st.sidebar.selectbox(
+    "Compte utilisé pour les charges pro",
+    COMPTES,
+    index=COMPTES.index(
+        str(parametres_mois["compte_charges_pro"])
+        if str(parametres_mois["compte_charges_pro"]) in COMPTES
+        else "Revolut"
+    ),
+)
+
 objectif_epargne = st.sidebar.number_input(
-    "Objectif d’épargne",
+    "Objectif d’épargne du mois",
     min_value=0.0,
-    value=float(
-        parametres["objectif_epargne"]
-    ),
+    value=float(parametres_mois["objectif_epargne"]),
     step=50.0,
     format="%.2f",
 )
 
+if periode_choisie == PERIODES[0]:
+    st.sidebar.divider()
+    st.sidebar.subheader("Soldes de départ en juillet 2026")
 
-# =====================================================
-# BARRE LATÉRALE : DETTE
-# =====================================================
+    solde_initial_revolut = st.sidebar.number_input(
+        "Solde Revolut au début de juillet",
+        value=float(parametres_mois["solde_initial_revolut"]),
+        step=50.0,
+        format="%.2f",
+    )
 
-st.sidebar.divider()
-st.sidebar.header("🏠 Dette appartement")
-
-dette_initiale = st.sidebar.number_input(
-    "Dette initiale envers mes parents",
-    min_value=0.0,
-    value=float(
-        parametres["dette_initiale"]
-    ),
-    step=50.0,
-    format="%.2f",
-)
-
-
-# =====================================================
-# CALCULS FREELANCE
-# =====================================================
-
-cotisations_urssaf = (
-    chiffre_affaires * taux_urssaf / 100
-)
-
-revenu_apres_urssaf = (
-    chiffre_affaires - cotisations_urssaf
-)
-
-revenu_net_disponible = (
-    revenu_apres_urssaf - autres_charges_pro
-)
-
-st.sidebar.metric(
-    "URSSAF à réserver",
-    format_euros(cotisations_urssaf),
-)
-
-st.sidebar.metric(
-    "Disponible avant dépenses perso",
-    format_euros(revenu_net_disponible),
-)
-
-
-# =====================================================
-# BARRE LATÉRALE : BUDGETS
-# =====================================================
+    solde_initial_lydia = st.sidebar.number_input(
+        "Solde Lydia au début de juillet",
+        value=float(parametres_mois["solde_initial_lydia"]),
+        step=50.0,
+        format="%.2f",
+    )
+else:
+    solde_initial_revolut = float(
+        parametres_mois["solde_initial_revolut"]
+    )
+    solde_initial_lydia = float(
+        parametres_mois["solde_initial_lydia"]
+    )
 
 st.sidebar.divider()
-st.sidebar.header("🎯 Budgets par catégorie")
+st.sidebar.subheader("Budgets par catégorie")
 
-budgets_categories = {}
+budgets = {}
 
-for categorie in CATEGORIES:
-    budgets_categories[categorie] = (
-        st.sidebar.number_input(
-            categorie,
-            min_value=0.0,
-            value=float(
-                parametres.get(categorie, 0.0)
-            ),
-            step=10.0,
-            format="%.2f",
-            key=f"budget_{categorie}",
-        )
+for categorie in CATEGORIES_BUDGET:
+    budgets[categorie] = st.sidebar.number_input(
+        categorie,
+        min_value=0.0,
+        value=float(parametres_mois.get(f"budget_{categorie}", 0.0)),
+        step=10.0,
+        format="%.2f",
+        key=f"budget_{periode_choisie}_{categorie}",
     )
 
 if st.sidebar.button(
-    "Enregistrer mes paramètres",
+    "Enregistrer ce mois",
     use_container_width=True,
 ):
-    nouveaux_parametres = {
-        "chiffre_affaires": chiffre_affaires,
+    valeurs = {
+        "periode": str(periode_choisie),
+        "ca_revolut": ca_revolut,
+        "ca_lydia": ca_lydia,
         "taux_urssaf": taux_urssaf,
-        "autres_charges_pro": autres_charges_pro,
+        "compte_urssaf": compte_urssaf,
+        "charges_pro": charges_pro,
+        "compte_charges_pro": compte_charges_pro,
         "objectif_epargne": objectif_epargne,
-        "dette_initiale": dette_initiale,
+        "solde_initial_revolut": solde_initial_revolut,
+        "solde_initial_lydia": solde_initial_lydia,
     }
 
-    nouveaux_parametres.update(
-        budgets_categories
-    )
+    for categorie, montant_budget in budgets.items():
+        valeurs[f"budget_{categorie}"] = montant_budget
 
-    enregistrer_parametres(
-        nouveaux_parametres
-    )
-
-    st.sidebar.success(
-        "Paramètres enregistrés."
-    )
+    df_mois = enregistrer_parametres_mois(df_mois, valeurs)
+    st.sidebar.success("Mois enregistré.")
+    st.rerun()
 
 
-# =====================================================
-# ONGLETS
-# =====================================================
+# ============================================================
+# CALCULS PRINCIPAUX
+# ============================================================
 
-onglet_budget, onglet_dette = st.tabs(
+cache_soldes = {}
+
+soldes = calculer_soldes_mois(
+    periode_choisie,
+    df_mois,
+    depenses,
+    remboursements,
+    cache_soldes,
+)
+
+depenses_mois = filtrer_periode(depenses, periode_choisie)
+remboursements_mois = filtrer_periode(
+    remboursements,
+    periode_choisie,
+)
+
+total_deja_rembourse = (
+    remboursements["montant"].sum()
+    if not remboursements.empty
+    else 0.0
+)
+
+dette_initiale = float(parametres_generaux["dette_initiale"])
+dette_restante = max(dette_initiale - total_deja_rembourse, 0.0)
+
+reste_apres_objectif = soldes["fin_total"] - objectif_epargne
+
+
+# ============================================================
+# INTERFACE
+# ============================================================
+
+st.title("Budget personnel")
+st.caption(
+    "Suivi mensuel de juillet 2026 à juillet 2027, avec report automatique des soldes."
+)
+
+onglet_accueil, onglet_depenses, onglet_dette, onglet_recurrences, onglet_historique = st.tabs(
     [
-        "💳 Budget mensuel",
-        "🏠 Dette appartement",
+        "Tableau de bord",
+        "Dépenses",
+        "Dette appartement",
+        "Dépenses récurrentes",
+        "Historique",
     ]
 )
 
 
-# =====================================================
-# ONGLET 1 : BUDGET MENSUEL
-# =====================================================
+# ============================================================
+# TABLEAU DE BORD
+# ============================================================
 
-with onglet_budget:
+with onglet_accueil:
+    st.subheader(libelle_periode(periode_choisie))
 
-    st.subheader("➕ Ajouter une dépense")
+    col1, col2, col3, col4 = st.columns(4)
 
-    with st.form(
-        "formulaire_ajout_depense",
-        clear_on_submit=True,
-    ):
-        col1, col2, col3, col4 = st.columns(4)
+    col1.metric(
+        "Solde de début total",
+        format_euros(
+            soldes["debut_revolut"]
+            + soldes["debut_lydia"]
+        ),
+    )
+
+    col2.metric(
+        "Chiffre d’affaires encaissé",
+        format_euros(soldes["ca_total"]),
+    )
+
+    col3.metric(
+        "Total des sorties",
+        format_euros(
+            soldes["depenses_total"]
+            + soldes["remboursements_total"]
+            + soldes["urssaf"]
+            + soldes["charges_pro"]
+        ),
+    )
+
+    col4.metric(
+        "Solde de fin total",
+        format_euros(soldes["fin_total"]),
+    )
+
+    st.divider()
+
+    col_revolut, col_lydia = st.columns(2)
+
+    with col_revolut:
+        st.subheader("Revolut")
+        a, b, c = st.columns(3)
+        a.metric("Début", format_euros(soldes["debut_revolut"]))
+        b.metric("Revenus", format_euros(soldes["ca_revolut"]))
+        c.metric("Fin", format_euros(soldes["fin_revolut"]))
+
+    with col_lydia:
+        st.subheader("Lydia")
+        a, b, c = st.columns(3)
+        a.metric("Début", format_euros(soldes["debut_lydia"]))
+        b.metric("Revenus", format_euros(soldes["ca_lydia"]))
+        c.metric("Fin", format_euros(soldes["fin_lydia"]))
+
+    st.divider()
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    col1.metric("URSSAF à réserver", format_euros(soldes["urssaf"]))
+    col2.metric("Charges professionnelles", format_euros(soldes["charges_pro"]))
+    col3.metric("Dépenses personnelles", format_euros(soldes["depenses_total"]))
+    col4.metric("Dette remboursée ce mois", format_euros(soldes["remboursements_total"]))
+
+    st.subheader("Objectif d’épargne")
+
+    if objectif_epargne <= 0:
+        st.info("Aucun objectif d’épargne défini pour ce mois.")
+    elif soldes["fin_total"] >= objectif_epargne:
+        st.success(
+            f"Objectif atteignable. Après avoir mis de côté "
+            f"{format_euros(objectif_epargne)}, il resterait "
+            f"{format_euros(reste_apres_objectif)}."
+        )
+        st.progress(1.0)
+    else:
+        progression = max(soldes["fin_total"] / objectif_epargne, 0.0)
+        st.warning(
+            f"Il manque {format_euros(objectif_epargne - soldes['fin_total'])} "
+            "pour atteindre l’objectif."
+        )
+        st.progress(min(progression, 1.0))
+
+    st.subheader("Budgets par catégorie")
+
+    resultats_budgets = []
+
+    for categorie in CATEGORIES_BUDGET:
+        if categorie == "Dette appartement":
+            depense_categorie = soldes["remboursements_total"]
+        else:
+            depense_categorie = (
+                depenses_mois.loc[
+                    depenses_mois["categorie"] == categorie,
+                    "montant",
+                ].sum()
+                if not depenses_mois.empty
+                else 0.0
+            )
+
+        budget = float(budgets[categorie])
+        reste = budget - depense_categorie
+
+        if budget > 0 or depense_categorie > 0:
+            resultats_budgets.append(
+                {
+                    "Catégorie": categorie,
+                    "Budget": budget,
+                    "Dépensé": depense_categorie,
+                    "Reste": reste,
+                }
+            )
+
+    if not resultats_budgets:
+        st.info("Aucun budget ni dépense enregistré pour ce mois.")
+    else:
+        df_budgets = pd.DataFrame(resultats_budgets)
+
+        st.dataframe(
+            df_budgets,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Budget": st.column_config.NumberColumn(
+                    "Budget",
+                    format="%.2f €",
+                ),
+                "Dépensé": st.column_config.NumberColumn(
+                    "Dépensé",
+                    format="%.2f €",
+                ),
+                "Reste": st.column_config.NumberColumn(
+                    "Reste",
+                    format="%.2f €",
+                ),
+            },
+        )
+
+    st.subheader("Répartition des dépenses")
+
+    graphique = (
+        depenses_mois
+        .groupby("categorie")["montant"]
+        .sum()
+        .sort_values(ascending=False)
+        if not depenses_mois.empty
+        else pd.Series(dtype=float)
+    )
+
+    if soldes["remboursements_total"] > 0:
+        graphique.loc["Dette appartement"] = soldes["remboursements_total"]
+
+    if graphique.empty:
+        st.info("Aucune dépense enregistrée pour ce mois.")
+    else:
+        st.bar_chart(graphique)
+
+
+# ============================================================
+# DEPENSES
+# ============================================================
+
+with onglet_depenses:
+    st.subheader("Ajouter une dépense")
+
+    with st.form("formulaire_depense", clear_on_submit=True):
+        col1, col2, col3, col4, col5 = st.columns(5)
 
         with col1:
             date_depense = st.date_input(
                 "Date",
-                value=date.today(),
-                key="date_depense",
+                value=date(
+                    periode_choisie.year,
+                    periode_choisie.month,
+                    1,
+                ),
             )
 
         with col2:
@@ -501,7 +1039,7 @@ with onglet_budget:
         with col3:
             categorie = st.selectbox(
                 "Catégorie",
-                CATEGORIES,
+                CATEGORIES_DEPENSES,
             )
 
         with col4:
@@ -510,758 +1048,564 @@ with onglet_budget:
                 min_value=0.0,
                 step=1.0,
                 format="%.2f",
-                key="montant_depense",
             )
 
-        ajouter_depense = st.form_submit_button(
-            "Ajouter la dépense",
+        with col5:
+            compte = st.selectbox(
+                "Compte",
+                COMPTES,
+            )
+
+        ajouter = st.form_submit_button(
+            "Ajouter",
             use_container_width=True,
         )
 
-    if ajouter_depense:
+    if ajouter:
         if not description.strip():
             st.error("Ajoute une description.")
-
         elif montant <= 0:
-            st.error(
-                "Le montant doit être supérieur à 0 €."
-            )
-
+            st.error("Le montant doit être supérieur à 0 €.")
         else:
-            nouvelle_depense = pd.DataFrame(
-                [
-                    {
-                        "date": pd.to_datetime(
-                            date_depense
-                        ),
-                        "description": (
-                            description.strip()
-                        ),
-                        "categorie": categorie,
-                        "montant": float(montant),
-                    }
-                ]
+            depenses = ajouter_depense(
+                depenses,
+                date_depense,
+                description,
+                categorie,
+                montant,
+                compte,
             )
-
-            depenses = pd.concat(
-                [depenses, nouvelle_depense],
-                ignore_index=True,
-            )
-
-            enregistrer_depenses(depenses)
-
-            st.success("Dépense enregistrée.")
+            st.success("Dépense ajoutée.")
             st.rerun()
 
-    # -------------------------------------------------
-    # FILTRAGE DES DÉPENSES
-    # -------------------------------------------------
+    st.subheader("Dépenses du mois")
 
-    if not depenses.empty:
-        depenses["date"] = pd.to_datetime(
-            depenses["date"]
-        )
-
-        depenses_du_mois = depenses[
-            (
-                depenses["date"].dt.month
-                == mois_choisi
-            )
-            & (
-                depenses["date"].dt.year
-                == annee_choisie
-            )
-        ].copy()
-
+    if depenses_mois.empty:
+        st.info("Aucune dépense pour ce mois.")
     else:
-        depenses_du_mois = depenses.copy()
-
-    # -------------------------------------------------
-    # REMBOURSEMENTS DU MOIS
-    # -------------------------------------------------
-
-    if not remboursements.empty:
-        remboursements["date"] = pd.to_datetime(
-            remboursements["date"]
-        )
-
-        remboursements_du_mois = remboursements[
-            (
-                remboursements["date"].dt.month
-                == mois_choisi
-            )
-            & (
-                remboursements["date"].dt.year
-                == annee_choisie
-            )
-        ].copy()
-
-    else:
-        remboursements_du_mois = (
-            remboursements.copy()
-        )
-
-    total_depenses_classiques = depenses_du_mois[
-        "montant"
-    ].sum()
-
-    total_remboursements_mois = (
-        remboursements_du_mois["montant"].sum()
-        if not remboursements_du_mois.empty
-        else 0.0
-    )
-
-    total_sorties_mois = (
-        total_depenses_classiques
-        + total_remboursements_mois
-    )
-
-    reste_apres_depenses = (
-        revenu_net_disponible
-        - total_sorties_mois
-    )
-
-    epargne_potentielle = max(
-        reste_apres_depenses,
-        0,
-    )
-
-    taux_depenses = (
-        total_sorties_mois / revenu_net_disponible
-        if revenu_net_disponible > 0
-        else 0
-    )
-
-    # -------------------------------------------------
-    # RÉSUMÉ
-    # -------------------------------------------------
-
-    st.divider()
-
-    st.subheader(
-        f"📊 Résumé — "
-        f"{MOIS[mois_choisi]} {annee_choisie}"
-    )
-
-    col1, col2, col3, col4, col5, col6 = (
-        st.columns(6)
-    )
-
-    col1.metric(
-        "Chiffre d’affaires",
-        format_euros(chiffre_affaires),
-    )
-
-    col2.metric(
-        "URSSAF à réserver",
-        format_euros(cotisations_urssaf),
-    )
-
-    col3.metric(
-        "Disponible net",
-        format_euros(revenu_net_disponible),
-    )
-
-    col4.metric(
-        "Dépenses",
-        format_euros(total_depenses_classiques),
-    )
-
-    col5.metric(
-        "Dette remboursée",
-        format_euros(total_remboursements_mois),
-    )
-
-    col6.metric(
-        "Reste disponible",
-        format_euros(reste_apres_depenses),
-    )
-
-    # -------------------------------------------------
-    # ALERTES
-    # -------------------------------------------------
-
-    st.subheader("🚨 État du mois")
-
-    if reste_apres_depenses < 0:
-        st.error(
-            "Tu as dépassé ton revenu disponible de "
-            f"{format_euros(abs(reste_apres_depenses))}."
-        )
-
-    elif epargne_potentielle < objectif_epargne:
-        manque = (
-            objectif_epargne
-            - epargne_potentielle
-        )
-
-        st.warning(
-            f"Il te manque {format_euros(manque)} "
-            "pour atteindre ton objectif d’épargne."
-        )
-
-    else:
-        st.success(
-            "Tu peux atteindre ton objectif "
-            "d’épargne ce mois-ci."
-        )
-
-    if revenu_net_disponible > 0:
-        st.write(
-            f"Tu as utilisé **"
-            f"{taux_depenses * 100:.1f} %** "
-            "de ton revenu disponible."
-        )
-
-        st.progress(
-            min(max(taux_depenses, 0.0), 1.0)
-        )
-
-    # -------------------------------------------------
-    # BUDGETS PAR CATÉGORIE
-    # -------------------------------------------------
-
-    st.divider()
-    st.subheader("🎯 Budgets par catégorie")
-
-    resultats_categories = []
-
-    for nom_categorie in CATEGORIES:
-
-        if nom_categorie == "Dette appartement":
-            depense_categorie = (
-                total_remboursements_mois
-            )
-        else:
-            depense_categorie = (
-                depenses_du_mois.loc[
-                    depenses_du_mois["categorie"]
-                    == nom_categorie,
-                    "montant",
-                ].sum()
-            )
-
-        budget_categorie = (
-            budgets_categories[nom_categorie]
-        )
-
-        reste_categorie = (
-            budget_categorie
-            - depense_categorie
-        )
-
-        resultats_categories.append(
-            {
-                "Catégorie": nom_categorie,
-                "Budget": budget_categorie,
-                "Dépensé": depense_categorie,
-                "Reste": reste_categorie,
+        tableau = depenses_mois.copy()
+        tableau["date"] = tableau["date"].dt.strftime("%d/%m/%Y")
+        tableau = tableau.rename(
+            columns={
+                "date": "Date",
+                "description": "Description",
+                "categorie": "Catégorie",
+                "montant": "Montant",
+                "compte": "Compte",
             }
         )
 
-    dataframe_budgets = pd.DataFrame(
-        resultats_categories
-    )
-
-    dataframe_budgets = dataframe_budgets[
-        (dataframe_budgets["Budget"] > 0)
-        | (dataframe_budgets["Dépensé"] > 0)
-    ]
-
-    if dataframe_budgets.empty:
-        st.info(
-            "Ajoute tes budgets dans le menu "
-            "de gauche."
-        )
-
-    else:
-        for _, ligne in (
-            dataframe_budgets.iterrows()
-        ):
-            nom_categorie = ligne["Catégorie"]
-            budget = float(ligne["Budget"])
-            depense = float(ligne["Dépensé"])
-            reste = float(ligne["Reste"])
-
-            col_nom, col_barre, col_montants = (
-                st.columns([1, 3, 1.5])
-            )
-
-            with col_nom:
-                st.write(
-                    f"**{nom_categorie}**"
-                )
-
-            with col_barre:
-                if budget > 0:
-                    progression = depense / budget
-
-                    st.progress(
-                        min(
-                            max(progression, 0.0),
-                            1.0,
-                        )
-                    )
-                else:
-                    st.caption(
-                        "Aucun budget défini"
-                    )
-
-            with col_montants:
-                if budget > 0:
-                    st.write(
-                        f"{format_euros(depense)} / "
-                        f"{format_euros(budget)}"
-                    )
-
-                    if reste < 0:
-                        st.error(
-                            "Dépassé de "
-                            f"{format_euros(abs(reste))}"
-                        )
-
-                    elif reste > 0:
-                        st.caption(
-                            "Reste : "
-                            f"{format_euros(reste)}"
-                        )
-
-                else:
-                    st.write(
-                        format_euros(depense)
-                    )
-
-    # -------------------------------------------------
-    # GRAPHIQUE
-    # -------------------------------------------------
-
-    st.divider()
-    st.subheader("📈 Dépenses par catégorie")
-
-    depenses_pour_graphique = (
-        depenses_du_mois
-        .groupby("categorie")["montant"]
-        .sum()
-        .reset_index()
-    )
-
-    if total_remboursements_mois > 0:
-        ligne_dette = pd.DataFrame(
-            [
-                {
-                    "categorie": "Dette appartement",
-                    "montant": (
-                        total_remboursements_mois
-                    ),
-                }
-            ]
-        )
-
-        depenses_pour_graphique = pd.concat(
-            [
-                depenses_pour_graphique,
-                ligne_dette,
-            ],
-            ignore_index=True,
-        )
-
-    if depenses_pour_graphique.empty:
-        st.info(
-            "Aucune dépense enregistrée "
-            "pour ce mois."
-        )
-
-    else:
-        depenses_pour_graphique = (
-            depenses_pour_graphique
-            .groupby("categorie")["montant"]
-            .sum()
-            .sort_values(ascending=False)
-        )
-
-        st.bar_chart(
-            depenses_pour_graphique
-        )
-
-    # -------------------------------------------------
-    # LISTE DES DÉPENSES
-    # -------------------------------------------------
-
-    st.divider()
-    st.subheader("🧾 Mes dépenses personnelles")
-
-    if depenses_du_mois.empty:
-        st.info(
-            "Aucune dépense personnelle "
-            "pour ce mois."
-        )
-
-    else:
-        tableau_depenses = (
-            depenses_du_mois.copy()
-        )
-
-        tableau_depenses["date"] = (
-            tableau_depenses["date"]
-            .dt.strftime("%d/%m/%Y")
-        )
-
-        tableau_depenses = (
-            tableau_depenses.rename(
-                columns={
-                    "date": "Date",
-                    "description": "Description",
-                    "categorie": "Catégorie",
-                    "montant": "Montant",
-                }
-            )
-        )
-
         st.dataframe(
-            tableau_depenses,
+            tableau[
+                [
+                    "Date",
+                    "Description",
+                    "Catégorie",
+                    "Montant",
+                    "Compte",
+                ]
+            ],
             use_container_width=True,
             hide_index=True,
             column_config={
-                "Montant": (
-                    st.column_config.NumberColumn(
-                        "Montant",
-                        format="%.2f €",
-                    )
+                "Montant": st.column_config.NumberColumn(
+                    "Montant",
+                    format="%.2f €",
                 ),
             },
         )
 
-    # -------------------------------------------------
-    # SUPPRESSION D’UNE DÉPENSE
-    # -------------------------------------------------
+        st.subheader("Supprimer une dépense")
 
-    if not depenses_du_mois.empty:
-        st.subheader(
-            "🗑️ Supprimer une dépense personnelle"
-        )
+        options = {}
 
-        options_depenses = {}
-
-        for index, ligne in (
-            depenses_du_mois.iterrows()
-        ):
+        for index, ligne in depenses_mois.iterrows():
             texte = (
-                f"{ligne['date'].strftime('%d/%m/%Y')}"
-                f" — {ligne['description']}"
-                f" — {format_euros(ligne['montant'])}"
-                f" — n°{index + 1}"
+                f"{ligne['date'].strftime('%d/%m/%Y')} — "
+                f"{ligne['description']} — "
+                f"{format_euros(ligne['montant'])} — "
+                f"{ligne['compte']}"
             )
+            options[texte] = index
 
-            options_depenses[texte] = index
-
-        depense_selectionnee = st.selectbox(
-            "Dépense à supprimer",
-            list(options_depenses.keys()),
-            key="suppression_depense",
+        selection = st.selectbox(
+            "Dépense",
+            options=list(options.keys()),
         )
 
-        confirmation_depense = st.checkbox(
-            "Je confirme la suppression "
-            "de cette dépense.",
-            key="confirmation_depense",
+        confirmation = st.checkbox(
+            "Je confirme la suppression.",
+            key="confirmer_suppression_depense",
         )
 
         if st.button(
             "Supprimer la dépense",
-            disabled=not confirmation_depense,
+            disabled=not confirmation,
         ):
-            index_a_supprimer = (
-                options_depenses[
-                    depense_selectionnee
-                ]
-            )
-
             depenses = depenses.drop(
-                index=index_a_supprimer
+                index=options[selection]
             ).reset_index(drop=True)
-
-            enregistrer_depenses(depenses)
-
+            sauvegarder_depenses(depenses)
             st.success("Dépense supprimée.")
             st.rerun()
 
 
-# =====================================================
-# ONGLET 2 : DETTE APPARTEMENT
-# =====================================================
+# ============================================================
+# DETTE
+# ============================================================
 
 with onglet_dette:
+    st.subheader("Dette appartement")
 
-    total_deja_rembourse = (
-        remboursements["montant"].sum()
-        if not remboursements.empty
-        else 0.0
+    nouvelle_dette_initiale = st.number_input(
+        "Montant initial dû aux parents",
+        min_value=0.0,
+        value=float(dette_initiale),
+        step=50.0,
+        format="%.2f",
     )
 
-    total_deja_rembourse = min(
-        total_deja_rembourse,
-        dette_initiale,
-    )
-
-    dette_restante = max(
-        dette_initiale - total_deja_rembourse,
-        0,
-    )
+    if st.button("Enregistrer le montant de la dette"):
+        sauvegarder_parametres_generaux(nouvelle_dette_initiale)
+        st.success("Dette initiale enregistrée.")
+        st.rerun()
 
     progression_dette = (
         total_deja_rembourse / dette_initiale
         if dette_initiale > 0
-        else 0
+        else 0.0
     )
-
-    st.subheader("🏠 Suivi de ma dette")
 
     col1, col2, col3 = st.columns(3)
-
-    col1.metric(
-        "Dette initiale",
-        format_euros(dette_initiale),
-    )
-
-    col2.metric(
-        "Déjà remboursé",
-        format_euros(total_deja_rembourse),
-    )
-
-    col3.metric(
-        "Reste à rembourser",
-        format_euros(dette_restante),
-    )
+    col1.metric("Dette initiale", format_euros(dette_initiale))
+    col2.metric("Déjà remboursé", format_euros(total_deja_rembourse))
+    col3.metric("Reste à rembourser", format_euros(dette_restante))
 
     if dette_initiale > 0:
-        st.progress(
-            min(max(progression_dette, 0.0), 1.0)
-        )
+        st.progress(min(max(progression_dette, 0.0), 1.0))
 
-        st.write(
-            f"Tu as remboursé **"
-            f"{progression_dette * 100:.1f} %** "
-            "de ta dette."
-        )
+    st.subheader("Ajouter un remboursement")
 
-    if dette_restante == 0:
-        st.success(
-            "🎉 La dette appartement est entièrement "
-            "remboursée."
-        )
-
-    else:
-        st.info(
-            f"Il te reste encore "
-            f"**{format_euros(dette_restante)}** "
-            "à rembourser à tes parents."
-        )
-
-    # -------------------------------------------------
-    # AJOUTER UN REMBOURSEMENT
-    # -------------------------------------------------
-
-    st.divider()
-    st.subheader("➕ Ajouter un remboursement")
-
-    with st.form(
-        "formulaire_remboursement",
-        clear_on_submit=True,
-    ):
-        col1, col2, col3 = st.columns(3)
+    with st.form("formulaire_remboursement", clear_on_submit=True):
+        col1, col2, col3, col4 = st.columns(4)
 
         with col1:
             date_remboursement = st.date_input(
-                "Date du remboursement",
-                value=date.today(),
+                "Date",
+                value=date(
+                    periode_choisie.year,
+                    periode_choisie.month,
+                    1,
+                ),
                 key="date_remboursement",
             )
 
         with col2:
-            description_remboursement = (
-                st.text_input(
-                    "Description",
-                    value=(
-                        "Remboursement dette appartement"
-                    ),
-                )
+            description_remboursement = st.text_input(
+                "Description",
+                value="Remboursement dette appartement",
             )
 
         with col3:
-            montant_remboursement = (
-                st.number_input(
-                    "Montant remboursé",
-                    min_value=0.0,
-                    step=50.0,
-                    format="%.2f",
-                )
+            montant_remboursement = st.number_input(
+                "Montant",
+                min_value=0.0,
+                step=50.0,
+                format="%.2f",
+                key="montant_remboursement",
             )
 
-        ajouter_remboursement = (
-            st.form_submit_button(
-                "Enregistrer le remboursement",
-                use_container_width=True,
+        with col4:
+            compte_remboursement = st.selectbox(
+                "Compte",
+                COMPTES,
+                key="compte_remboursement",
             )
+
+        ajouter_remboursement = st.form_submit_button(
+            "Ajouter le remboursement",
+            use_container_width=True,
         )
 
     if ajouter_remboursement:
-
         if montant_remboursement <= 0:
-            st.error(
-                "Le remboursement doit être "
-                "supérieur à 0 €."
-            )
-
+            st.error("Le montant doit être supérieur à 0 €.")
         elif montant_remboursement > dette_restante:
             st.error(
-                "Ce montant dépasse la dette restante "
-                f"de {format_euros(dette_restante)}."
+                f"Le montant dépasse la dette restante de "
+                f"{format_euros(dette_restante)}."
             )
-
         else:
-            nouveau_remboursement = pd.DataFrame(
-                [
-                    {
-                        "date": pd.to_datetime(
-                            date_remboursement
-                        ),
-                        "description": (
-                            description_remboursement
-                            .strip()
-                            or (
-                                "Remboursement dette "
-                                "appartement"
-                            )
-                        ),
-                        "montant": float(
-                            montant_remboursement
-                        ),
-                    }
-                ]
+            nouveau = pd.DataFrame(
+                [{
+                    "id": uuid4().hex,
+                    "date": pd.Timestamp(date_remboursement),
+                    "description": (
+                        description_remboursement.strip()
+                        or "Remboursement dette appartement"
+                    ),
+                    "montant": float(montant_remboursement),
+                    "compte": compte_remboursement,
+                }]
             )
 
             remboursements = pd.concat(
-                [
-                    remboursements,
-                    nouveau_remboursement,
-                ],
+                [remboursements, nouveau],
                 ignore_index=True,
             )
-
-            enregistrer_remboursements(
-                remboursements
-            )
-
-            st.success(
-                "Remboursement enregistré."
-            )
-
+            sauvegarder_remboursements(remboursements)
+            st.success("Remboursement ajouté.")
             st.rerun()
 
-    # -------------------------------------------------
-    # HISTORIQUE DES REMBOURSEMENTS
-    # -------------------------------------------------
-
-    st.divider()
-    st.subheader(
-        "📋 Historique des remboursements"
-    )
+    st.subheader("Historique des remboursements")
 
     if remboursements.empty:
-        st.info(
-            "Tu n’as encore enregistré "
-            "aucun remboursement."
-        )
-
+        st.info("Aucun remboursement enregistré.")
     else:
         historique = remboursements.copy()
-
-        historique["date"] = (
-            historique["date"]
-            .dt.strftime("%d/%m/%Y")
-        )
-
+        historique["date"] = historique["date"].dt.strftime("%d/%m/%Y")
         historique = historique.rename(
             columns={
                 "date": "Date",
                 "description": "Description",
-                "montant": "Montant remboursé",
+                "montant": "Montant",
+                "compte": "Compte",
             }
         )
 
         st.dataframe(
-            historique,
+            historique[
+                [
+                    "Date",
+                    "Description",
+                    "Montant",
+                    "Compte",
+                ]
+            ],
             use_container_width=True,
             hide_index=True,
             column_config={
-                "Montant remboursé": (
-                    st.column_config.NumberColumn(
-                        "Montant remboursé",
-                        format="%.2f €",
-                    )
+                "Montant": st.column_config.NumberColumn(
+                    "Montant",
+                    format="%.2f €",
                 ),
             },
         )
 
-    # -------------------------------------------------
-    # SUPPRIMER UN REMBOURSEMENT
-    # -------------------------------------------------
+        st.subheader("Supprimer un remboursement")
 
-    if not remboursements.empty:
-        st.divider()
-        st.subheader(
-            "🗑️ Corriger un remboursement"
-        )
+        options = {}
 
-        options_remboursements = {}
-
-        for index, ligne in (
-            remboursements.iterrows()
-        ):
+        for index, ligne in remboursements.iterrows():
             texte = (
-                f"{ligne['date'].strftime('%d/%m/%Y')}"
-                f" — {ligne['description']}"
-                f" — {format_euros(ligne['montant'])}"
-                f" — n°{index + 1}"
+                f"{ligne['date'].strftime('%d/%m/%Y')} — "
+                f"{ligne['description']} — "
+                f"{format_euros(ligne['montant'])} — "
+                f"{ligne['compte']}"
             )
+            options[texte] = index
 
-            options_remboursements[texte] = index
-
-        remboursement_selectionne = (
-            st.selectbox(
-                "Remboursement à supprimer",
-                list(
-                    options_remboursements.keys()
-                ),
-            )
+        selection = st.selectbox(
+            "Remboursement",
+            options=list(options.keys()),
         )
 
-        confirmation_remboursement = st.checkbox(
-            "Je confirme la suppression "
-            "de ce remboursement.",
-            key="confirmation_remboursement",
+        confirmation = st.checkbox(
+            "Je confirme la suppression.",
+            key="confirmer_suppression_remboursement",
         )
 
         if st.button(
             "Supprimer le remboursement",
-            disabled=not confirmation_remboursement,
+            disabled=not confirmation,
         ):
-            index_a_supprimer = (
-                options_remboursements[
-                    remboursement_selectionne
-                ]
-            )
-
             remboursements = remboursements.drop(
-                index=index_a_supprimer
+                index=options[selection]
             ).reset_index(drop=True)
-
-            enregistrer_remboursements(
-                remboursements
-            )
-
-            st.success(
-                "Remboursement supprimé."
-            )
-
+            sauvegarder_remboursements(remboursements)
+            st.success("Remboursement supprimé.")
             st.rerun()
+
+
+# ============================================================
+# RECURRENCES
+# ============================================================
+
+with onglet_recurrences:
+    st.subheader("Ajouter une dépense récurrente")
+
+    with st.form("formulaire_recurrence", clear_on_submit=True):
+        col1, col2, col3, col4 = st.columns(4)
+
+        with col1:
+            description_recurrence = st.text_input(
+                "Description",
+                placeholder="Exemple : Loyer",
+            )
+
+        with col2:
+            categorie_recurrence = st.selectbox(
+                "Catégorie",
+                CATEGORIES_DEPENSES,
+                key="categorie_recurrence",
+            )
+
+        with col3:
+            montant_recurrence = st.number_input(
+                "Montant",
+                min_value=0.0,
+                step=10.0,
+                format="%.2f",
+                key="montant_recurrence",
+            )
+
+        with col4:
+            compte_recurrence = st.selectbox(
+                "Compte",
+                COMPTES,
+                key="compte_recurrence",
+            )
+
+        col5, col6, col7 = st.columns(3)
+
+        with col5:
+            jour_recurrence = st.number_input(
+                "Jour du mois",
+                min_value=1,
+                max_value=31,
+                value=1,
+                step=1,
+            )
+
+        with col6:
+            debut_recurrence = st.selectbox(
+                "Premier mois",
+                PERIODES,
+                index=0,
+                format_func=libelle_periode,
+                key="debut_recurrence",
+            )
+
+        with col7:
+            fin_recurrence = st.selectbox(
+                "Dernier mois",
+                PERIODES,
+                index=len(PERIODES) - 1,
+                format_func=libelle_periode,
+                key="fin_recurrence",
+            )
+
+        ajouter_recurrence = st.form_submit_button(
+            "Créer la dépense récurrente",
+            use_container_width=True,
+        )
+
+    if ajouter_recurrence:
+        if not description_recurrence.strip():
+            st.error("Ajoute une description.")
+        elif montant_recurrence <= 0:
+            st.error("Le montant doit être supérieur à 0 €.")
+        elif debut_recurrence > fin_recurrence:
+            st.error("Le premier mois doit être avant le dernier mois.")
+        else:
+            nouvelle = pd.DataFrame(
+                [{
+                    "id": uuid4().hex,
+                    "description": description_recurrence.strip(),
+                    "categorie": categorie_recurrence,
+                    "montant": float(montant_recurrence),
+                    "compte": compte_recurrence,
+                    "jour": int(jour_recurrence),
+                    "debut": str(debut_recurrence),
+                    "fin": str(fin_recurrence),
+                    "active": True,
+                }]
+            )
+
+            recurrents = pd.concat(
+                [recurrents, nouvelle],
+                ignore_index=True,
+            )
+            sauvegarder_recurrences(recurrents)
+            st.success("Dépense récurrente créée.")
+            st.rerun()
+
+    if st.button(
+        f"Ajouter les récurrences de {libelle_periode(periode_choisie)}"
+    ):
+        depenses, nombre = ajouter_recurrences_du_mois(
+            depenses,
+            recurrents,
+            periode_choisie,
+        )
+
+        if nombre == 0:
+            st.info(
+                "Aucune nouvelle dépense récurrente à ajouter pour ce mois."
+            )
+        else:
+            st.success(f"{nombre} dépense(s) récurrente(s) ajoutée(s).")
+        st.rerun()
+
+    st.subheader("Liste des dépenses récurrentes")
+
+    if recurrents.empty:
+        st.info("Aucune dépense récurrente.")
+    else:
+        affichage = recurrents.copy()
+        affichage["debut"] = affichage["debut"].apply(
+            lambda x: libelle_periode(pd.Period(str(x), freq="M"))
+        )
+        affichage["fin"] = affichage["fin"].apply(
+            lambda x: libelle_periode(pd.Period(str(x), freq="M"))
+        )
+        affichage = affichage.rename(
+            columns={
+                "description": "Description",
+                "categorie": "Catégorie",
+                "montant": "Montant",
+                "compte": "Compte",
+                "jour": "Jour",
+                "debut": "Début",
+                "fin": "Fin",
+                "active": "Active",
+            }
+        )
+
+        st.dataframe(
+            affichage[
+                [
+                    "Description",
+                    "Catégorie",
+                    "Montant",
+                    "Compte",
+                    "Jour",
+                    "Début",
+                    "Fin",
+                    "Active",
+                ]
+            ],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Montant": st.column_config.NumberColumn(
+                    "Montant",
+                    format="%.2f €",
+                ),
+            },
+        )
+
+        options = {
+            f"{ligne['description']} — {format_euros(ligne['montant'])} — {ligne['compte']}": index
+            for index, ligne in recurrents.iterrows()
+        }
+
+        selection = st.selectbox(
+            "Dépense récurrente à supprimer",
+            options=list(options.keys()),
+        )
+
+        confirmation = st.checkbox(
+            "Je confirme la suppression.",
+            key="confirmer_suppression_recurrence",
+        )
+
+        if st.button(
+            "Supprimer la dépense récurrente",
+            disabled=not confirmation,
+        ):
+            recurrents = recurrents.drop(
+                index=options[selection]
+            ).reset_index(drop=True)
+            sauvegarder_recurrences(recurrents)
+            st.success("Dépense récurrente supprimée.")
+            st.rerun()
+
+
+# ============================================================
+# HISTORIQUE
+# ============================================================
+
+with onglet_historique:
+    st.subheader("Historique mensuel")
+
+    lignes_historique = []
+    cache_historique = {}
+
+    for periode in PERIODES:
+        valeurs = calculer_soldes_mois(
+            periode,
+            df_mois,
+            depenses,
+            remboursements,
+            cache_historique,
+        )
+
+        lignes_historique.append(
+            {
+                "Mois": libelle_periode(periode),
+                "Solde début": (
+                    valeurs["debut_revolut"]
+                    + valeurs["debut_lydia"]
+                ),
+                "CA encaissé": valeurs["ca_total"],
+                "URSSAF": valeurs["urssaf"],
+                "Charges pro": valeurs["charges_pro"],
+                "Dépenses": valeurs["depenses_total"],
+                "Dette remboursée": valeurs["remboursements_total"],
+                "Solde fin": valeurs["fin_total"],
+            }
+        )
+
+    historique = pd.DataFrame(lignes_historique)
+
+    st.dataframe(
+        historique,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Solde début": st.column_config.NumberColumn(
+                "Solde début",
+                format="%.2f €",
+            ),
+            "CA encaissé": st.column_config.NumberColumn(
+                "CA encaissé",
+                format="%.2f €",
+            ),
+            "URSSAF": st.column_config.NumberColumn(
+                "URSSAF",
+                format="%.2f €",
+            ),
+            "Charges pro": st.column_config.NumberColumn(
+                "Charges pro",
+                format="%.2f €",
+            ),
+            "Dépenses": st.column_config.NumberColumn(
+                "Dépenses",
+                format="%.2f €",
+            ),
+            "Dette remboursée": st.column_config.NumberColumn(
+                "Dette remboursée",
+                format="%.2f €",
+            ),
+            "Solde fin": st.column_config.NumberColumn(
+                "Solde fin",
+                format="%.2f €",
+            ),
+        },
+    )
+
+    graphique_historique = historique.set_index("Mois")["Solde fin"]
+    st.line_chart(graphique_historique)
+
+    fichier_export = historique.to_csv(
+        index=False
+    ).encode("utf-8-sig")
+
+    st.download_button(
+        "Télécharger l’historique en CSV",
+        data=fichier_export,
+        file_name="historique_budget.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
